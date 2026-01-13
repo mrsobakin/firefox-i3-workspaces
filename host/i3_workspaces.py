@@ -1,254 +1,119 @@
-#!/usr/bin/python3 -u
+#!/usr/bin/env python3
 
+import asyncio
 import json
 import logging
-import os
-from queue import SimpleQueue
 import re
-import select
 import struct
 import sys
-import time
-from threading import Thread
-from typing import Any, NamedTuple
+from typing import Any, Dict, Optional
 
-from i3ipc import Connection, Event, WindowEvent, WorkspaceEvent  # type: ignore
+from i3ipc.aio import Connection
+from i3ipc.events import Event, IpcBaseEvent, WindowEvent, WorkspaceEvent
 
+LOG_FILE = '/tmp/i3_workspaces.log'
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
 
-ConID = int
-JsonValue = None | bool | int | float | str | list | dict[str, Any]
-UUID = str
-WindowID = int
-Workspace = str
+class Bridge:
+    def __init__(self):
+        self.i3: Optional[Connection] = None
+        self.tracked_windows: Dict[int, str] = {}
+        self.known_workspaces: Dict[int, str] = {}
 
-
-class Shutdown:
-    pass
-
-
-SHUTDOWN = Shutdown()
-
-
-class Request(NamedTuple):
-    """
-    Incoming message.
-    """
-    body: JsonValue
-
-
-class Notification(NamedTuple):
-    """
-    Outgoing message.
-    """
-    body: JsonValue
-
-
-class ReceiverThread(Thread):
-    """
-    A thread that reads and decodes messages from stdin and puts them into queue.
-    """
-
-    def __init__(self, q: SimpleQueue) -> None:
-        super().__init__(daemon=True, name='receiver')
-        self._breaker_w, self._breaker_r = os.pipe()
-        self._q = q
-
-    def stop(self) -> None:
-        """
-        Tell the thread to terminate, and wait until it does.
-
-        This can be called from outside the thread.
-        """
-        os.close(self._breaker_w)
-        self.join()
-        os.close(self._breaker_r)
-
-    def _get_message(self) -> JsonValue | Shutdown:
-        """
-        Read and decode a message from stdin.
-
-        Return SHUTDOWN if the host app should terminate.
-        """
-        readable, _, _ = select.select([sys.stdin, self._breaker_r], [], [])
-        if self._breaker_r in readable:
-            logging.info('normal shutdown')
-            return SHUTDOWN
-        raw_length = sys.stdin.buffer.read(4)
-        if len(raw_length) == 0:
-            logging.warning('cannot read message length, shutting down')
-            return SHUTDOWN
-        [message_length] = struct.unpack('@I', raw_length)
-        message = sys.stdin.buffer.read(message_length).decode('utf-8')
-        return json.loads(message)
-
-    def run(self) -> None:
-        """
-        Receive incoming messages, decode and put them in the queue.
-        """
+    async def start(self):
         try:
-            while True:
-                received_message = self._get_message()
-                if isinstance(received_message, Shutdown):
-                    self._q.put(SHUTDOWN)
-                    return
-                logging.info('→ %s', received_message)
-                self._q.put(Request(received_message))
+            self.i3 = await Connection(auto_reconnect=True).connect()
+            logging.info("Connected to i3")
+
+            tree = await self.i3.get_tree()
+            self.known_workspaces = {ws.id: ws.name for ws in tree.workspaces()}
+
+            self.i3.on(Event.WINDOW_MOVE, self.on_window_move)
+            self.i3.on(Event.WORKSPACE_RENAME, self.on_workspace_rename)
+
+            await asyncio.gather(self.i3.main(), self.native_messaging_loop())
+
         except Exception:
-            logging.exception('exception')
-
-
-class I3Thread(Thread):
-    """
-    A thread that maintains a connection to i3 and handles subscribed events.
-    """
-
-    def __init__(self, q: SimpleQueue) -> None:
-        super().__init__(daemon=True, name='i3')
-        self._i3: Connection | None = None
-        self._q = q
-        self._stopping = False
-        self._windows: dict[WindowID, UUID] = {}
-        self._workspaces: dict[ConID, Workspace] = {}
-        self._inhibit_move = 0
-
-    def stop(self) -> None:
-        """
-        Tell the thread to stop and wait until it does.
-        """
-        self._stopping = True
-        if self._i3:
-            self._i3.main_quit()
-        self.join()
-
-    def handle_windows(self, windows: dict[UUID, Workspace | None]) -> Notification:
-        """
-        Handle the incoming request to identify, move and/or locate windows.
-
-        Return the corresponding outgoing message.
-        """
-        self._inhibit_move += 1
-        i3 = Connection()
-        time.sleep(0.1)
-        tree = i3.get_tree()
-        response_payload: dict[UUID, Workspace] = {}
-        for uuid, workspace in windows.items():
-            cons = tree.find_named(fr'^{re.escape(uuid)} \|')
-            if not cons:
-                logging.error('%s not found', uuid)
-                continue
-            if len(cons) > 1:
-                logging.warning('%s found more than once', uuid)
-
-            self._windows[cons[0].id] = uuid
-
-            if workspace is not None:
-                cons[0].command(f'move --no-auto-back-and-forth container to workspace "{workspace}"')
-                response_payload[uuid] = workspace
-            else:
-                response_payload[uuid] = cons[0].workspace().name
-
-        self._inhibit_move -= 1
-        return Notification({'windows': response_payload})
-
-    def window_move(self, i3: Connection, e: WindowEvent) -> None:
-        """
-        When a window is moved, tell the addon which and where.
-        """
-        if self._inhibit_move:
-            return  # handle_windows is moving things around
-
-        window = e.container.id
-
-        uuid = self._windows.get(window)
-        if uuid is None:
-            return  # not a window we’re tracking
-
-        workspace = Connection().get_tree().find_by_id(window).workspace().name
-
-        self._q.put(Notification({'window::move': {uuid: workspace}}))
-
-    def workspace_renamed(self, i3: Connection, e: WorkspaceEvent) -> None:
-        """
-        When a workspace is renamed, tell the addon its old and new names.
-        """
-        old_name = self._workspaces.get(e.current.id, None)
-        self._workspaces[e.current.id] = e.current.name
-        if old_name:
-            self._q.put(Notification({'workspace::rename': {old_name: e.current.name}}))
-
-    def run(self) -> None:
-        """
-        Maintain an i3 connection. If disconnected, reconnect and resubscribe.
-        Maintain a map of workspace container IDs to names.
-        Watch for window move and workspace rename events, and forward them to the addon.
-        """
-        try:
-            while True:
-                try:
-                    self._i3 = Connection()
-                except FileNotFoundError:
-                    time.sleep(0.1)
-                    continue
-                logging.info('connected')
-
-                self._workspaces = {ws.id: ws.name for ws in self._i3.get_tree().workspaces()}
-                self._i3.on(Event.WINDOW_MOVE, self.window_move)
-                self._i3.on(Event.WORKSPACE_RENAME, self.workspace_renamed)
-                self._i3.main()
-                logging.info('disconnected')
-                self._i3 = None
-                if self._stopping:
-                    return
-        except Exception:
-            logging.exception('exception')
-
-
-def send_message(message_content: JsonValue) -> None:
-    """
-    Encode and send a message to stdout.
-    """
-    logging.info('← %s', message_content)
-    encoded_content = json.dumps(message_content, separators=(',', ':')).encode('utf-8')
-    encoded_length = struct.pack('@I', len(encoded_content))
-    sys.stdout.buffer.write(encoded_length)
-    sys.stdout.buffer.write(encoded_content)
-    sys.stdout.buffer.flush()
-
-
-def main():
-    logging.basicConfig(
-        filename='/tmp/i3_workspaces.log',
-        level=logging.DEBUG,
-        format='%(levelname)-8s %(asctime)s [%(threadName)s] %(message)s')
-    # logging.basicConfig(handlers=[], level=logging.ERROR)
-    try:
-        q = SimpleQueue()
-
-        receiver = ReceiverThread(q)
-        receiver.start()
-
-        i3thread = I3Thread(q)
-        i3thread.start()
-
-        try:
-            while True:
-                message = q.get()
-                if message is SHUTDOWN:
-                    logging.info('shutting down')
-                    break
-                if isinstance(message, Notification):
-                    send_message(message.body)
-                if isinstance(message, Request):
-                    if 'windows' in message.body:
-                        response = i3thread.handle_windows(message.body['windows'])
-                        send_message(response.body)
+            logging.exception("Fatal error in main loop")
         finally:
-            receiver.stop()
-            i3thread.stop()
+            if self.i3:
+                self.i3.main_quit()
 
-    except BaseException:
-        logging.exception('exception')
+    async def send_json(self, msg: Any):
+        try:
+            logging.info('→ %s', msg)
+            encoded = json.dumps(msg, separators=(',', ':')).encode('utf-8')
+            sys.stdout.buffer.write(struct.pack('@I', len(encoded)))
+            sys.stdout.buffer.write(encoded)
+            sys.stdout.buffer.flush()
+        except Exception:
+            logging.exception("Failed to send message")
 
+    async def native_messaging_loop(self):
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        await asyncio.get_running_loop().connect_read_pipe(lambda: protocol, sys.stdin)
+
+        while True:
+            header = await reader.readexactly(4)
+            if not header:
+                break
+
+            msg_len = struct.unpack('@I', header)[0]
+            msg_raw = await reader.readexactly(msg_len)
+            message = json.loads(msg_raw)
+            logging.info('← %s', message)
+
+            if 'windows' in message:
+                await self.sync_windows(message['windows'])
+
+    async def sync_windows(self, windows: Dict[str, Optional[str]]):
+        tree = await self.i3.get_tree()
+        response: Dict[str, str] = {}
+
+        for uuid, target_workspace in windows.items():
+            cons = tree.find_named(fr'^{re.escape(uuid)} \|')
+
+            if not cons:
+                logging.warning(f'{uuid} not found')
+                continue
+
+            con = cons[0]
+            self.tracked_windows[con.id] = uuid
+
+            if target_workspace:
+                await con.command(f'move --no-auto-back-and-forth container to workspace "{target_workspace}"')
+                response[uuid] = target_workspace
+            else:
+                response[uuid] = con.workspace().name
+
+        await self.send_json({'windows': response})
+
+    async def on_window_move(self, _: Connection, e: IpcBaseEvent):
+        assert isinstance(e, WindowEvent)
+
+        uuid = self.tracked_windows.get(e.container.id)
+        if not uuid:
+            return
+
+        tree = await self.i3.get_tree()
+        con = tree.find_by_id(e.container.id)
+
+        if con and con.workspace():
+            await self.send_json({'window::move': {uuid: con.workspace().name}})
+
+    async def on_workspace_rename(self, _: Connection, e: IpcBaseEvent):
+        assert isinstance(e, WorkspaceEvent)
+
+        old_name = self.known_workspaces.get(e.current.id)
+        self.known_workspaces[e.current.id] = e.current.name
+
+        if old_name and old_name != e.current.name:
+            await self.send_json({'workspace::rename': {old_name: e.current.name}})
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(Bridge().start())
