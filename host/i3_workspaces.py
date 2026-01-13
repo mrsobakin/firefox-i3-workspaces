@@ -132,14 +132,14 @@ class I3Thread(Thread):
         tree = i3.get_tree()
         response_payload: dict[UUID, Workspace] = {}
         for uuid, workspace in windows.items():
-            cons = tree.find_titled(fr'^{re.escape(uuid)} \|')
+            cons = tree.find_named(fr'^{re.escape(uuid)} \|')
             if not cons:
                 logging.error('%s not found', uuid)
                 continue
             if len(cons) > 1:
                 logging.warning('%s found more than once', uuid)
 
-            self._windows[cons[0].window] = uuid
+            self._windows[cons[0].id] = uuid
 
             if workspace is not None:
                 cons[0].command(f'move --no-auto-back-and-forth container to workspace "{workspace}"')
@@ -157,12 +157,14 @@ class I3Thread(Thread):
         if self._inhibit_move:
             return  # handle_windows is moving things around
 
-        window = e.container.window
+        window = e.container.id
+
         uuid = self._windows.get(window)
         if uuid is None:
             return  # not a window we’re tracking
 
-        workspace = Connection().get_tree().find_by_window(window).workspace().name
+        workspace = Connection().get_tree().find_by_id(window).workspace().name
+
         self._q.put(Notification({'window::move': {uuid: workspace}}))
 
     def workspace_renamed(self, i3: Connection, e: WorkspaceEvent) -> None:
